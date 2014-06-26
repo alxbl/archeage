@@ -16,16 +16,16 @@
 -- Disclaimer: I am Lua noob.
 
 --------------------------------------------------------------------------------
--- DISSECTORS (You can probably use the [] tag for C-F)
+-- "Globals" & TOC
 -- -----------------------------------------------------------------------------
-local aa = Proto("aa", "ArcheAge Protocol"); -- Root Dissector [AA]
---------------------------------------------------------------------------------
+local msg_handlers = {}; -- Type -> Dissector
+local msg_types = {};    -- Type -> String
 
---------------------------------------------------------------------------------
--- HELPERS
---------------------------------------------------------------------------------
-local msg_types = { [0x1202] = "Poll Chat", [0x1302] = "Poll Chat Response" }; -- Could also be a Keep-Alive?
-local function type_string(t)
+local aa = Proto("aa", "ArcheAge Protocol"); -- [aa]
+local aa_chat = Proto("aa.chat", "Chat Message"); -- [aa.chat]
+
+-- Some Helpers
+local function t2s(t) -- Type to String
 	if (msg_types[t]) then
 		return msg_types[t];
 	else 
@@ -34,7 +34,9 @@ local function type_string(t)
 end
 --------------------------------------------------------------------------------
 
--- [AA]
+--------------------------------------------------------------------------------
+-- [aa] ROOT DISSECTOR
+--------------------------------------------------------------------------------
 local f_len  = ProtoField.uint16("aa.len", "Length", base.DEC);
 local f_srv  = ProtoField.bool("aa.reply", "Server Reply"); -- 0xdd
 local f_type = ProtoField.uint16("aa.type", "Message Type", base.HEX);
@@ -67,7 +69,7 @@ function aa.dissector(buf, pkt, tree)
 		end
 
 		-- ArcheAge transmits in little endian. So much for convention.
-		data_len = buf(offset,2):le_uint();
+		data_len = buf(offset, 2):le_uint();
 		
 		local remaining = len - offset - 2;
 		if (data_len > remaining) then -- We want the remaining length of the segment.
@@ -84,31 +86,80 @@ function aa.dissector(buf, pkt, tree)
 		local t = tree:add(aa, buf(offset, data_len+2), "PDU"); -- Include the length as part of the root.
 
 		-- Payload Length without length bytes.
-		t:add(f_len, buf(offset,2), buf(offset,2):le_uint());
-		--debug(string.format("Frame #%d @ %d/%d: Reading Length: %d", pkt.number, offset, len, data_len));
+		t:add(f_len, buf(offset, 2), buf(offset, 2):le_uint());
 		offset = offset + 2;
 
 		-- Server Reply Flag (This could also be part of the message type.)
-		t:add(f_srv, buf(offset,1)); 
-		--debug(string.format("Frame #%d @ %d/%d: Reading f_srv: %d", pkt.number, offset, len, buf(offset,1)));
+		t:add(f_srv, buf(offset, 1)); 
 		offset = offset + 1;
 
 		-- Message Type
-		local msg_type = buf(offset,2):le_uint();
-		t:add(f_type, buf(offset,2),  msg_type, string.format("Type: 0x%04x (%s)", msg_type, type_string(msg_type)));
-		--debug(string.format("Frame #%d @ %d/%d: Reading Type: %d", pkt.number, offset, len, msg_type));
+		local msg_type = buf(offset, 2):le_uint();
+		t:add(f_type, buf(offset, 2),  msg_type, string.format("Type: 0x%04x (%s)", msg_type, t2s(msg_type)));
 		offset = offset + 2; -- 2 bytes.
 
 		-- Padding (This is most likely wrong.)
-		t:add(f_pad, buf(offset,1));
+		t:add(f_pad, buf(offset, 1));
 		offset = offset + 1;
 
-		t:add(f_payload, buf(offset,data_len-4)); -- 4 bytes removed due to: f_srv, f_type and 1 byte padding.
-		--debug(string.format("Frame #%d @ %d/%d: Reading Payload: %d", pkt.number, offset, len, (offset-data_len-4)));
-		offset = offset + data_len - 4;
+		-- Dissect the Payload
+		local payload = buf(offset, data_len-4); -- 4 bytes removed due to: f_srv, f_type and 1 byte padding.
+		if (msg_handlers[msg_type]) then
+			local d = msg_handlers[msg_type]
+			d:call(payload:tvb(), pkt, t);
+		else
+			t:add(f_payload, payload); -- Unknown Payload.
+		end 
+		offset = offset + data_len - 4; -- Skip to the next PDU.
 	end
 end
 
+--------------------------------------------------------------------------------
+-- [aa.chat] CHAT DISSECTOR
+--------------------------------------------------------------------------------
+msg_types[0x1202] = "Ping";
+msg_types[0x1302] = "Pong";
+
+msg_types[0xcc01] = "Chat";
+
+aa_chat.fields = {};
+local f_chat_unknown  = ProtoField.bytes("aa.chat.unknown", "Unknown"); table.insert(aa_chat.fields, f_chat_unknown);-- TODO: Reverse
+local f_chat_nicklen  = ProtoField.uint16("aa.chat.nick.len", "Nickname Length"); table.insert(aa_chat.fields, f_chat_nicklen);
+local f_chat_nickname = ProtoField.string("aa.chat.nick", "Nickname"); table.insert(aa_chat.fields, f_chat_nickname);
+local f_chat_msglen   = ProtoField.uint16("aa.chat.msg.len", "Message Length"); table.insert(aa_chat.fields, f_chat_msglen);
+local f_chat_msg      = ProtoField.string("aa.chat.msg", "Message"); table.insert(aa_chat.fields, f_chat_msg);
+local f_chat_epilogue = ProtoField.bytes("aa.chat.epilogue", "Unknown"); table.insert(aa_chat.fields, f_chat_epilogue);-- TODO: Reverse
+
+function aa_chat.dissector(buf, pkt, tree)
+	local t = tree:add(aa_chat, buf());
+	local offset = 0;
+	
+	-- 22 non-reversed bytes
+	t:add(f_chat_unknown, buf(offset, 21)); 
+	offset = offset + 21;
+
+	-- Nickname Length
+	local nick_len = buf(offset, 2):le_uint();
+	t:add(f_chat_nicklen, buf(offset, 2), nick_len);
+	offset = offset + 2;
+	
+	-- Nickname
+	t:add(f_chat_nickname, buf(offset, nick_len));
+	offset = offset + nick_len;
+
+	-- Message Length
+	local msg_len = buf(offset, 2):le_uint();
+	t:add(f_chat_msglen, buf(offset, 2), msg_len);
+	offset = offset + 2;
+	
+	-- Message
+	t:add(f_chat_msg, buf(offset, msg_len));
+	offset = offset + msg_len;
+
+	-- Non-reversed Epilogue
+	t:add(f_chat_epilogue, buf(offset, buf:len()-offset));
+end
+msg_handlers[0xcc01] = aa_chat.dissector;
 
 --------------------------------------------------------------------------------
 -- REGISTER
